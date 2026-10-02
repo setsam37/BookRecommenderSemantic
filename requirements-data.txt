@@ -1,0 +1,9 @@
+-r requirements.txt
+transformers==5.18.0
+torch==2.8.0
+tqdm==4.70.1
+kagglehub==1.0.2
+matplotlib==3.10.8
+seaborn==0.13.2
+notebook==7.6.3
+ipywidgets==8.1.9
