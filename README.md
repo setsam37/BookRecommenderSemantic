@@ -42,6 +42,12 @@ python gradio-dashboard.py
 
 Open the local URL printed in the terminal, usually `http://127.0.0.1:7860`. The supplied CSV files are enough to run the app; preprocessing notebooks do not need to run first.
 
+## Docker and AWS
+
+Run `docker compose up --build --detach` after configuring `.env` to start the container at `http://127.0.0.1:7860`. A named volume preserves the book index. The image excludes secrets, Git history, notebooks, and local caches, and runs as a non-root user.
+
+The selected cloud service is **Amazon EC2**. See [Docker and AWS deployment instructions](deploy/README.md) for the CloudFormation template, secure key setup, restricted network access, verification, cost considerations, and cleanup. GitHub Actions runs both Python tests and container checks on every push and pull request. A deployment template alone is not proof of a running AWS deployment.
+
 The first search embeds the catalog through the paid OpenAI API. Later searches reuse the stored book embeddings and embed only the query. Importing the Python file or starting the UI makes no embedding request. A missing key or failed request produces a readable UI error; details appear in the local terminal.
 
 ## Index storage and ranking

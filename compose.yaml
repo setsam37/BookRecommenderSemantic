@@ -1,0 +1,22 @@
+services:
+  recommender:
+    build: .
+    image: book-recommender:local
+    ports:
+      - "127.0.0.1:7860:7860"
+    env_file:
+      - .env
+    volumes:
+      - book-index:/app/.cache/chroma
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+volumes:
+  book-index:

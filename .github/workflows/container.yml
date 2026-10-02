@@ -1,0 +1,48 @@
+name: Container
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  build-and-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build runtime image with a secret sentinel outside the build context
+        run: |
+          printf 'OPENAI_API_KEY=DO_NOT_COPY_THIS_SENTINEL\n' > .env
+          docker build --tag book-recommender:test .
+      - name: Start the UI without API credentials
+        run: |
+          docker volume create book-index-test
+          docker run --detach --name recommender --publish 127.0.0.1:7860:7860 \
+            --mount source=book-index-test,target=/app/.cache/chroma book-recommender:test
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent http://127.0.0.1:7860/ > /dev/null; then break; fi
+            sleep 2
+          done
+          curl --fail --silent http://127.0.0.1:7860/ > /dev/null
+          docker exec recommender python -c "import os; from pathlib import Path; assert os.getuid() != 0; assert not Path('/app/.env').exists(); assert not os.getenv('OPENAI_API_KEY'); Path('/app/.cache/chroma/persistence-test').write_text('saved')"
+      - name: Verify persistence across container replacement
+        run: |
+          docker rm --force recommender
+          docker run --rm --mount source=book-index-test,target=/app/.cache/chroma \
+            --entrypoint python book-recommender:test -c \
+            "from pathlib import Path; assert Path('/app/.cache/chroma/persistence-test').read_text() == 'saved'"
+      - name: Logs on failure
+        if: failure()
+        run: docker logs recommender || true
+      - name: Cleanup
+        if: always()
+        run: |
+          docker rm --force recommender || true
+          docker volume rm book-index-test || true
+  validate-aws-template:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: pip install cfn-lint==1.57.1
+      - run: cfn-lint deploy/aws-ec2.yaml
