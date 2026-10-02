@@ -1,78 +1,92 @@
-# AWS deployment: Amazon EC2
+# Azure deployment: Azure Virtual Machines
 
-This project uses **Amazon EC2**, with Docker on Amazon Linux 2023. A named Docker volume stores the Chroma index on the instance's encrypted EBS root disk. GitHub Actions runs Python tests, builds the container, checks the UI without API credentials, verifies index-volume persistence across container replacement, and validates the CloudFormation template on every push and pull request.
+The selected service is **Azure Virtual Machines**: an Ubuntu 24.04 Linux VM runs Docker, and its managed OS disk stores the Chroma index in a named volume. The disk persists across VM/container restarts. A managed identity reads only the selected OpenAI secret from Azure Key Vault. GitHub Actions runs app tests, builds the container, checks the UI without credentials, verifies volume persistence across container replacement, and compiles the Azure Bicep template on every push and pull request.
 
-This is a single-instance demonstration deployment. The security group limits port 7860 to `AllowedCidr`; administration uses AWS Systems Manager Session Manager instead of SSH. The demo URL uses HTTP. Do not open it to the whole Internet; use an HTTPS reverse proxy or load balancer and application authentication before turning it into a public service. There is no automatic deployment from CI, so a push cannot silently provision paid AWS resources.
+This is a single-VM demonstration in Azure public cloud. A network security group restricts port 7860 to your public IP range; SSH and other inbound ports are closed. Administration uses Azure **Run command**. The demo URL uses HTTP. Add HTTPS and application authentication before unrestricted public access. CI validates deployment but does not automatically create paid resources.
 
-## Run with Docker locally
+## Docker locally
 
-Install Docker Engine with Compose, or Docker Desktop. In the repository root:
+Install Docker Engine with Compose or Docker Desktop. In the repository root:
 
 ```sh
 cp .env.example .env
-# Set the replacement OPENAI_API_KEY in .env, then:
+# Save your replacement OPENAI_API_KEY in .env, then:
 docker compose up --build --detach
 docker compose logs --follow recommender
 ```
 
-On Windows PowerShell use `Copy-Item .env.example .env` for the first command. Open <http://127.0.0.1:7860>. The API key is passed only at runtime: the image build context allows only runtime source/data, and excludes `.env`, Git history, and local caches. The container runs as a non-root user.
+On PowerShell use `Copy-Item .env.example .env` for the first command. Open <http://127.0.0.1:7860>. The image excludes `.env`, Git history, local caches, and notebooks, and runs as a non-root user. The key is passed only at runtime.
 
-The first search builds an index for 5,197 books using the paid OpenAI API. The `book-index` volume survives container restarts, replacement, and `docker compose down`. **Do not use `docker compose down --volumes` unless you intend to delete the index and pay to rebuild it.** The local index created outside Docker is not automatically copied into this volume.
+The first search embeds all 5,197 books through the paid OpenAI API. The `book-index` volume survives restarts, container replacement, and `docker compose down`. **`docker compose down --volumes` deletes the index and triggers rebuilding charges on the next search.** The existing index outside Docker is not automatically copied into this volume.
 
-## Deploy on AWS
+## Azure prerequisites
 
-Prerequisites: an AWS account with billing enabled; permissions to create EC2, security group, IAM role/instance profile, and CloudFormation resources; a public subnet with an Internet Gateway route; and a new OpenAI key. Keep every resource in the same AWS region. The template defaults to `t3.medium` and a 30 GiB encrypted gp3 disk. EC2, EBS, public IPv4, and OpenAI usage can incur charges; consult the AWS estimate before creating the stack.
+- An active subscription and permission to create a resource group, VM, networking, managed identity, and role assignment. Secret-scoped role assignment requires `Microsoft.Authorization/roleAssignments/write`; VM Contributor alone is insufficient.
+- Azure CLI with Bicep, or Azure Cloud Shell in Bash mode. Choose a region and VM size allowed by your subscription. The template defaults to `Standard_B2s` and a 30 GiB Standard SSD managed OS disk.
+- A dedicated resource group, an RBAC-enabled Key Vault in that group, and an existing secret named `openai-api-key`. The vault must allow the VM's outbound public-network access; private endpoints/restricted firewalls require additional networking.
+- An SSH public key for the VM administrator, although SSH network access remains closed.
 
-1. In **Systems Manager → Parameter Store**, create `/book-recommender/openai-api-key` as **SecureString**, using the default `aws/ssm` encryption key, and save the replacement OpenAI key as its value. Keep it out of the template, Git, screenshots, and chat. A custom KMS key needs an additional scoped `kms:Decrypt` permission and key policy; the supplied template assumes the default key.
-2. In **CloudFormation**, create a stack by uploading `deploy/aws-ec2.yaml`. Suggested stack name: `book-recommender`.
-3. Choose the VPC and a public subnet in it. Set `AllowedCidr` to your current public IPv4 followed by `/32`. Supply the full 40-character Git commit SHA containing the reviewed Docker changes as `CodeCommit` (run `git rev-parse HEAD`). The revision must be published to GitHub so the instance can download it. Choose the instance size and review the estimated cost.
-4. Acknowledge IAM-resource creation and create the stack. It creates an EC2 instance, encrypted root disk, restricted security group, and an instance role that can read only the specified key parameter plus the standard Session Manager permissions. No SSH port is opened.
-5. Wait for the stack, then open its **Outputs → AppUrl**. Bootstrap continues after CloudFormation reports `CREATE_COMPLETE`; allow several minutes for package/image installation. If the page is unavailable, open the instance through **Session Manager**, then run:
+VM compute, managed disks, Standard public IPv4, Key Vault operations, and OpenAI usage can incur charges. Review the Azure estimate before creation. A free/student subscription does not guarantee that this configuration is free or available.
+
+## Deploy
+
+1. Sign in to Azure portal or run `az login`, then select your intended subscription. Create a dedicated resource group such as `book-recommender-rg` and an RBAC-enabled Key Vault with a globally unique name. In **Key Vault → Secrets**, save the replacement key as `openai-api-key`. Keep it out of chat, template parameters, shell history, and screenshots. Your account may need **Key Vault Secrets Officer** to create the secret; allow role changes to propagate.
+2. Clone the repository and check out the reviewed deployment revision. While the PR is open, use its branch; `master` receives the files after merge. In Cloud Shell, generate a project-specific administrator SSH key if needed:
 
 ```sh
-sudo tail -n 80 /var/log/cloud-init-output.log
-sudo docker ps
-sudo docker logs --tail 80 book-recommender
+ssh-keygen -t rsa -b 3072 -f "$HOME/.ssh/book-recommender" -N ''
+```
+
+Do not overwrite an existing key. Keep the private key private; only the `.pub` file is a deployment input.
+
+3. From the repository root, substitute your group, vault, and current public IPv4 CIDR (`YOUR_PUBLIC_IPV4/32`). `REVISION` must be a full, published Git commit containing the reviewed Docker deployment:
+
+```sh
+REVISION=$(git rev-parse HEAD)
+az deployment group what-if --resource-group book-recommender-rg \
+  --template-file deploy/azure-vm.bicep \
+  --parameters allowedCidr=YOUR_PUBLIC_IPV4/32 codeCommit="$REVISION" \
+    keyVaultName=YOUR_VAULT_NAME adminSshPublicKey="$(cat "$HOME/.ssh/book-recommender.pub")"
+```
+
+Review the resources and costs, then replace `what-if` with `create` using the same parameters. The template creates a VM, static public IP, network interface, network security group, virtual network, managed identity, and **Key Vault Secrets User** assignment scoped to that one secret. It does not create or overwrite the vault/secret. Password authentication is disabled; the private SSH key is not uploaded.
+
+4. Read `appUrl` from deployment outputs. Deployment success does not mean cloud-init has finished installing Docker/building the image. Allow several minutes. Bootstrap retries identity/Key Vault access for approximately 10 minutes plus request time. Failed/empty key retrieval stops startup.
+5. If the URL is unavailable, select the VM → **Run command → RunShellScript** and run:
+
+```sh
+tail -n 80 /var/log/cloud-init-output.log
+docker ps
+docker logs --tail 80 book-recommender
 curl --fail http://127.0.0.1:7860/
 ```
 
-6. Submit a book description and check that recommendations appear. The first search can take several minutes while the index builds. Test a category and emotional tone. Restart the container with `sudo docker restart book-recommender`, then search again to verify that the existing index is reused.
+Do not print `/opt/book-recommender/.env`. The URL is reachable only from your allowed IP. Submit a description, verify recommendations, then test a category and tone. Run `docker restart book-recommender` and search again to verify index reuse.
 
-The instance needs outbound Internet access to download dependencies/source, retrieve the SSM parameter, and call OpenAI. A private subnet or blocked outbound network will not work with this template. If your public IP changes, update `AllowedCidr`; if you stop and start EC2, its public IP can change, so read the new address from the EC2 console.
+## Rotation, updates, and persistence
 
-## Key rotation and updates
-
-After changing the Parameter Store value, open Session Manager and refresh the root-owned runtime file, then recreate the container. These commands print no key; substitute your AWS region and the deployed commit SHA:
+After changing the Key Vault secret, run this through Run command. Refresh must succeed before replacing the container; secrets are not printed:
 
 ```sh
-sudo -i
 set -euo pipefail
-cd /opt/book-recommender
-umask 077
-OPENAI_KEY=$(aws ssm get-parameter --name /book-recommender/openai-api-key --with-decryption --region YOUR_REGION --query Parameter.Value --output text)
-test -n "$OPENAI_KEY"
-test "$OPENAI_KEY" != None
-printf 'OPENAI_API_KEY=%s\n' "$OPENAI_KEY" > .env
-unset OPENAI_KEY
-printf 'OPENAI_EMBEDDING_MODEL=text-embedding-3-small\n' >> .env
+python3 /opt/book-recommender/azure_bootstrap.py --refresh-key
 docker rm --force book-recommender
 docker run --detach --name book-recommender --restart unless-stopped \
-  --publish 7860:7860 --env-file .env \
+  --publish 7860:7860 --env-file /opt/book-recommender/.env \
   --mount source=book-index,target=/app/.cache/chroma \
   --security-opt no-new-privileges:true --cap-drop ALL \
   --log-opt max-size=10m --log-opt max-file=3 \
   book-recommender:DEPLOYED_COMMIT_SHA
-exit
 ```
 
-For code updates, build the reviewed revision on the same instance, then recreate the container with the existing volume. Updating `CodeCommit` in CloudFormation changes user data but does not automatically rerun bootstrap on the existing instance. Back up the index before replacing the instance; a new catalog or embedding model deliberately creates a different index.
+Substitute the deployed commit SHA in the image tag. Updating template custom data does not rerun cloud-init on an existing VM. Build code updates on the same VM and recreate its container with the existing volume. Back up the disk/index before replacing or deleting the VM. Catalog/model changes deliberately create a new index. Update the NSG rule if your public IP changes.
 
 ## Evidence and cleanup
 
-For the assignment, record the GitHub commit, successful **Tests** and **Container** workflow runs, AWS service (**Amazon EC2**), region, instance ID, app URL, and a screenshot showing real recommendations. Do not claim a live deployment from a template alone; record the URL and check it after deploying.
+Record the published commit, successful **Tests** and **Container** workflows, service (**Azure Virtual Machines**), region, VM name, app URL, and a screenshot of real recommendations. A compiled template alone is not proof of a live deployment.
 
-Stopping EC2 pauses compute billing but EBS storage still incurs charges, and stopping does not guarantee all related costs cease. For complete stack cleanup, back up anything needed, then delete the CloudFormation stack. **The root disk and index are deleted when the instance is terminated.** The separately created Parameter Store secret is outside the stack; delete it separately when no longer needed. Do not delete an account's shared VPC or subnet.
+**Stop (deallocate)** the VM to stop compute billing; disks and static public IP can still incur charges. For full cleanup, back up anything needed, then delete the dedicated resource group and its project resources. The OS disk is configured for deletion with the VM, which deletes the index. Never delete a shared group/vault to clean up this demo. Key Vault soft-delete rules may retain a deleted vault.
 
-The optional custom REST API is not included; the existing Gradio UI is the assignment's deployed application.
+The optional custom REST API is omitted; the deployed application is the existing Gradio UI.
 
-References: [EC2 CloudFormation resource](https://docs.aws.amazon.com/AWSCloudFormation/latest/TemplateReference/aws-resource-ec2-instance.html), [Session Manager setup](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-getting-started.html), [Parameter Store](https://docs.aws.amazon.com/systems-manager/latest/userguide/systems-manager-parameter-store.html).
+References: [VM and Key Vault managed identity](https://learn.microsoft.com/en-us/azure/key-vault/general/tutorial-python-virtual-machine), [VM template reference](https://learn.microsoft.com/en-us/azure/templates/microsoft.compute/virtualmachines), [Key Vault RBAC](https://learn.microsoft.com/en-us/azure/key-vault/general/rbac-guide), [Bicep CLI](https://learn.microsoft.com/en-us/azure/azure-resource-manager/bicep/bicep-cli).
