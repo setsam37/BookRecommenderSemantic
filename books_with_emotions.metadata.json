@@ -1,0 +1,9 @@
+{
+  "model": "j-hartmann/emotion-english-distilroberta-base",
+  "revision": "0e1cd914e3d46199ed785853e12b57304e04178b",
+  "books": 5197,
+  "sentences": 24486,
+  "aggregation": "per-label maximum over period-separated sentences",
+  "truncation": 512,
+  "torch": "2.8.0+cpu"
+}

@@ -1,125 +1,153 @@
+"""Gradio interface and recommendation ranking. Importing makes no API calls."""
+from pathlib import Path
+from threading import Lock
 
 import pandas as pd
-import numpy as np
-from dotenv import load_dotenv
-
-from langchain_community.document_loaders import TextLoader
-from langchain_openai import OpenAIEmbeddings
-from langchain_text_splitters import CharacterTextSplitter
-from langchain_chroma import Chroma
-from langchain.schema import Document
 
 
+ROOT = Path(__file__).resolve().parent
+TONES = {'Happy': 'joy', 'Surprising': 'surprise', 'Angry': 'anger',
+         'Suspenseful': 'fear', 'Sad': 'sadness'}
+books = None
+db_books = None
+index_lock = Lock()
 
-import gradio as gr
 
-load_dotenv()
-
-books = pd.read_csv("books_with_emotions.csv")
-books["large_thumbnail"] = books["thumbnail"] + "&fife=w800"
-books["large_thumbnail"] = np.where(
-    books["large_thumbnail"].isna(),
-    "cover-not-found.jpg",
-    books["large_thumbnail"],
-)
-
-documents = []
-for _, row in books.iterrows():
-    doc = Document(
-        page_content=row['description'],  # Just the description
-        metadata={
-            'isbn13': int(row['isbn13'])  # Store ISBN as metadata
-        }
+def load_books(path=None):
+    """Read the bundled catalog independently of the working directory."""
+    frame = pd.read_csv(path or ROOT / 'books_with_emotions.csv')
+    required = {'isbn13', 'title', 'authors', 'description', 'thumbnail',
+                'simple_categories', *TONES.values()}
+    missing = required - set(frame.columns)
+    if missing:
+        raise ValueError(f'Catalog is missing columns: {", ".join(sorted(missing))}')
+    if frame.isbn13.isna().any() or frame.isbn13.duplicated().any():
+        raise ValueError('Catalog ISBNs must be nonempty and unique.')
+    frame['authors'] = frame['authors'].fillna('Unknown author')
+    frame['description'] = frame['description'].fillna('')
+    if not frame.description.str.strip().ne('').all():
+        raise ValueError('Every book must have a description before indexing.')
+    frame['large_thumbnail'] = frame['thumbnail'].fillna('').map(
+        lambda url: url + ('&' if '?' in url else '?') + 'fife=w800'
+        if isinstance(url, str) and url.strip()
+        else str(ROOT / 'cover-not-found.jpg')
     )
-    documents.append(doc)
-
-db_books = Chroma.from_documents(documents, OpenAIEmbeddings())
+    return frame
 
 
-
-def retrieve_semantic_recommendations(
-        query: str,
-        category: str = None,
-        tone: str = None,
-        initial_top_k: int = 50,
-        final_top_k: int = 16,
-) -> pd.DataFrame:
-
-    recs = db_books.similarity_search(query, k=initial_top_k)
-    books_list = [rec.metadata['isbn13'] for rec in recs]
-    book_recs = books[books["isbn13"].isin(books_list)].copy()
-
-    # Maintain the ranking order from similarity search
-    isbn_to_rank = {isbn: i for i, isbn in enumerate(books_list)}
-    book_recs['rank'] = book_recs['isbn13'].map(isbn_to_rank)
-    book_recs = book_recs.sort_values('rank').drop('rank', axis=1)
-
-    if category != "ALL":
-        book_recs = book_recs[book_recs["simple_categories"] == category][:final_top_k]
-    else:
-        book_recs = book_recs.head(final_top_k)
-
-    if tone == "Happy":
-        book_recs.sort_values(by="joy", ascending=False, inplace=False)
-    elif tone == "Surprising":
-        book_recs.sort_values(by="surprise", ascending=False, inplace=True)
-    elif tone == "Angry":
-        book_recs.sort_values(by="anger", ascending=False, inplace=True)
-    elif tone == "Suspenseful":
-        book_recs.sort_values(by="fear", ascending=False, inplace=True)
-    elif tone == "Sad":
-        book_recs.sort_values(by="sadness", ascending=False, inplace=True)
-
-    return book_recs.head(final_top_k)
+def get_books():
+    global books
+    if books is None:
+        books = load_books()
+    return books
 
 
-def recommend_books(
-        query: str,
-        category: str,
-        tone: str
-):
+def get_vector_store():
+    global db_books
+    if db_books is None:
+        with index_lock:
+            if db_books is None:
+                import os
+                from dotenv import load_dotenv
+                from search_index import load_or_create_index
 
+                load_dotenv(ROOT / '.env')
+                model = os.getenv('OPENAI_EMBEDDING_MODEL', 'text-embedding-3-small')
+                db_books = load_or_create_index(get_books(), ROOT / '.cache' / 'chroma', model)
+    return db_books
+
+
+def retrieve_semantic_recommendations(query: str, category: str = None,
+                                      tone: str = None, initial_top_k: int = 50,
+                                      final_top_k: int = 16) -> pd.DataFrame:
+    catalog = get_books()
+    if not isinstance(query, str) or not query.strip() or final_top_k <= 0:
+        return catalog.iloc[:0].copy()
+    if initial_top_k <= 0:
+        raise ValueError('initial_top_k must be positive.')
+    if tone not in (None, 'ALL', *TONES):
+        raise ValueError('Unknown emotional tone.')
+    candidates = catalog
+    search_options = {}
+    if category not in (None, 'ALL'):
+        candidates = catalog[catalog['simple_categories'] == category]
+        search_options['filter'] = {'simple_categories': category}
+    if candidates.empty:
+        return candidates.copy()
+
+    # Chroma applies category filtering before finding the nearest neighbors.
+    recs = get_vector_store().similarity_search(
+        query.strip(), k=min(max(initial_top_k, final_top_k), len(candidates)),
+        **search_options,
+    )
+    isbn_to_rank = {}
+    for rec in recs:
+        isbn_to_rank.setdefault(int(rec.metadata['isbn13']), len(isbn_to_rank))
+    result = candidates[candidates['isbn13'].isin(isbn_to_rank)].copy()
+    result['rank'] = result['isbn13'].map(isbn_to_rank)
+    result = result.sort_values('rank', kind='stable')
+    if tone in TONES:
+        result = result.sort_values(TONES[tone], ascending=False, kind='stable')
+    return result.head(final_top_k).drop(columns='rank')
+
+
+def recommend_books(query: str, category: str = 'ALL', tone: str = 'ALL'):
     recommendations = retrieve_semantic_recommendations(query, category, tone)
     results = []
-
     for _, row in recommendations.iterrows():
-        description = row["description"]
-        truncated_desc_split = description.split()
-        truncated_description = " ".join(truncated_desc_split[:30]) + "..."
-
-        authors_split = row["authors"].split(";")
-        if len(authors_split) == 2:
-            authors_str = f"{', '.join(authors_split[:-1])} and {authors_split[-1]}"
-        elif len(authors_split) > 2:
-            authors_str = f"{', '.join(authors_split[:-1])}, and {authors_split[-1]}"
+        words = str(row['description']).split()
+        description = ' '.join(words[:30]) + ('...' if len(words) > 30 else '')
+        value = row['authors']
+        authors = [part.strip() for part in value.split(';') if part.strip()] if isinstance(value, str) else []
+        if not authors:
+            author_text = 'Unknown author'
+        elif len(authors) == 1:
+            author_text = authors[0]
+        elif len(authors) == 2:
+            author_text = ' and '.join(authors)
         else:
-            authors_str = row["authors"]
-
-        caption = f"{row['title']} by {authors_str}: {truncated_description}"
-        results.append((row["large_thumbnail"], caption))
+            author_text = ', '.join(authors[:-1]) + ', and ' + authors[-1]
+        results.append((row['large_thumbnail'], f"{row['title']} by {author_text}: {description}"))
     return results
 
 
-categories = ["ALL"] + sorted(books["simple_categories"].unique())
-tones = ["ALL"] + ["Happy", "Surprising", "Angry", "Suspenseful", "Sad"]
+def build_dashboard():
+    import gradio as gr
 
-with gr.Blocks(theme = gr.themes.Glass()) as dashboard:
-    gr.Markdown("# Semantic book recommender")
+    catalog = get_books()
+    categories = ['ALL'] + sorted(catalog['simple_categories'].dropna().unique())
+    with gr.Blocks() as dashboard:
+        gr.Markdown('# Semantic book recommender')
+        with gr.Row():
+            query = gr.Textbox(label='Please enter a description of a book:',
+                               placeholder='e.g. A story about forgiveness')
+            category = gr.Dropdown(choices=categories, label='Select a category:', value='ALL')
+            tone = gr.Dropdown(choices=['ALL', *TONES], label='Select an emotional tone:', value='ALL')
+            submit = gr.Button('Find recommendations')
+        gr.Markdown('## Recommendations')
+        gallery = gr.Gallery(label='Recommended books', columns=8, rows=2)
 
-    with gr.Row():
-        user_query = gr.Textbox(label = "Please enter a description of a book:",
-                                placeholder = "e.g, A story about forgiveness")
-        category_dropdown = gr.Dropdown(choices = categories, label = "Select a category:", value = "ALL")
-        tone_dropdown = gr.Dropdown(choices = tones, label = "Select an emotional tone:", value = "ALL")
-        submit_button = gr.Button("Find recommendations")
+        def submit_query(query, category, tone):
+            if not query or not query.strip():
+                gr.Info('Enter a book description to find recommendations.')
+                return []
+            try:
+                result = recommend_books(query, category, tone)
+            except Exception as exc:
+                import logging
+                logging.getLogger(__name__).exception('Recommendation search failed')
+                raise gr.Error('Search is unavailable. Check your API key, connection, and terminal output.') from exc
+            if not result:
+                gr.Info('No matching books found. Try another category or description.')
+            return result
 
-    gr.Markdown("## Recommendations")
-    output = gr.Gallery(label = "Recommended books", columns = 8, rows = 2)
-
-    submit_button.click(fn = recommend_books,
-                        inputs = [user_query, category_dropdown, tone_dropdown],
-                        outputs = output)
+        submit.click(submit_query, inputs=[query, category, tone], outputs=gallery)
+        query.submit(submit_query, inputs=[query, category, tone], outputs=gallery)
+    return dashboard
 
 
-if __name__ == "__main__":
-    dashboard.launch()
+if __name__ == '__main__':
+    import gradio as gr
+    build_dashboard().queue().launch(
+        theme=gr.themes.Glass(), allowed_paths=[str(ROOT / 'cover-not-found.jpg')],
+    )
