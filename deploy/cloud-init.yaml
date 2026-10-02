@@ -1,0 +1,15 @@
+#cloud-config
+write_files:
+  - path: /opt/book-recommender/config.b64
+    owner: root:root
+    permissions: '0600'
+    content: __CONFIG_BASE64__
+  - path: /opt/book-recommender/azure_bootstrap.py
+    owner: root:root
+    permissions: '0700'
+    content: |
+      __BOOTSTRAP_SCRIPT__
+runcmd:
+  - [bash, -c, 'apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io python3 ca-certificates curl']
+  - [systemctl, enable, --now, docker]
+  - [python3, /opt/book-recommender/azure_bootstrap.py]

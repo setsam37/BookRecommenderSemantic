@@ -1,0 +1,8 @@
+# Allow only runtime inputs. Credentials, Git history, and local caches stay out.
+**
+!requirements.txt
+!gradio-dashboard.py
+!search_index.py
+!books_with_emotions.csv
+!cover-not-found.jpg
+!Dockerfile
